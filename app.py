@@ -43,7 +43,7 @@ page = st.sidebar.radio("Navigate", ["Home", "APBD Analyzer", "Fraud Detection",
 # Home
 # -----------------------
 if page == "Home":
-    st.title("📊 APBD Super — Rasio Keuangan & Macro Fraud Detection")
+    st.title("📊 APBD —Rasio Keuangan & Fraud Detection")
     st.markdown("""
     Aplikasi ini membantu:
     - Menghitung rasio keuangan (kemandirian, efektivitas, efisiensi, dll.)
