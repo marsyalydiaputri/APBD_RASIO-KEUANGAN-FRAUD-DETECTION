@@ -2,27 +2,24 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
-from sklearn.ensemble import IsolationForest
-import plotly.express as px
 import io
+import re
+import requests
+import plotly.express as px
 
-st.set_page_config(layout="wide", page_title="APBD Super — Rasio & Fraud Detection")
+st.set_page_config(layout="wide", page_title="APBD Analyzer (Robust)")
 
-# -----------------------
-# Helper: TEMPLATE EXCEL
-# -----------------------
-TEMPLATE_COLUMNS = [
-    "Tahun","SKPD","Kode_Rekening","Uraian","Jenis_Transaksi",
-    "PAD","Dana_Transfer","Pendapatan_Daerah","Target_PAD","Realisasi_PAD",
-    "Belanja_Operasi","Belanja_Modal","Total_Belanja","Anggaran_Belanja",
-    "Nilai_Transaksi"
-]
+st.title("📊 APBD Analyzer — Rasio & Visualisasi")
 
+# ----------------------------
+# Helper: Template Excel
+# ----------------------------
+TEMPLATE_COLUMNS = ["Akun","Anggaran","Realisasi","Persentase","Tahun"]
 SAMPLE_ROWS = [
-    [2024,"Dinas A","5.1.01","Belanja honor kegiatan X","Belanja",0,0,1000000,500000,480000,200000,300000,500000,550000,200000],
-    [2024,"Dinas B","5.2.02","Pembelian alat tulis","Belanja",0,0,1000000,0,0,50000,0,50000,50000,50000],
-    [2024,"Dinas A","4.1.01","Pendapatan PAD sektor X","Pendapatan",150000,0,150000,160000,155000,0,0,0,0,0],
+    ["Pendapatan Daerah", 3557491170098, 3758774961806, 105.66, 2024],
+    ["PAD", 322846709929, 561854145372, 174.03, 2024],
+    ["Belanja Pegawai", 1161122041234, 1058941535362, 91.20, 2024],
+    ["Belanja Modal", 1133163195359, 836917297001, 73.86, 2024],
 ]
 
 def make_template_excel():
@@ -33,208 +30,259 @@ def make_template_excel():
     buffer.seek(0)
     return buffer
 
-# -----------------------
-# Sidebar navigation
-# -----------------------
-st.sidebar.title("APBD Super (Menu)")
-page = st.sidebar.radio("Navigate", ["Home", "APBD Analyzer", "Fraud Detection", "Download Template"])
+# ----------------------------
+# Utility: parsing angka & deteksi kolom
+# ----------------------------
+def parse_number(x):
+    """Bersihkan string angka 'Rp 1.000.000' -> 1000000, juga handle numeric types."""
+    if pd.isna(x):
+        return 0.0
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+    s = str(x)
+    # remove common prefixes/characters
+    s = s.replace("Rp", "").replace("rp", "")
+    # remove whitespace
+    s = s.strip()
+    # handle parentheses for negatives e.g. (1.000)
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1]
+    # remove dots used as thousand separator and replace commas if decimal comma
+    # heuristic: if both '.' and ',' exist, assume '.' thousands, ',' decimal -> remove dots, replace ',' with '.'
+    if "." in s and "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        # if only dots and they look like thousands sep (more than 3 digits), remove dots
+        # else replace commas with dot
+        if "." in s and re.search(r"\.\d{1,2}$", s) is None:
+            s = s.replace(".", "")
+        s = s.replace(",", ".")
+    # remove any remaining non-number characters
+    s = re.sub(r"[^\d\.\-]", "", s)
+    try:
+        return float(s) if s not in ("", "-", ".") else 0.0
+    except:
+        return 0.0
 
-# -----------------------
-# Home
-# -----------------------
+def find_column_by_keywords(df, keywords):
+    """Cari nama kolom yang cocok berdasarkan keywords (list). Kembalikan first match or None."""
+    cols = df.columns.astype(str).tolist()
+    for k in keywords:
+        for c in cols:
+            if k.lower() in c.lower():
+                return c
+    return None
+
+# ----------------------------
+# Classification (auto-categorize akun)
+# ----------------------------
+def classify_account(name):
+    if not isinstance(name, str):
+        name = str(name)
+    n = name.lower()
+    # PAD (pendapatan asli daerah)
+    if "pad" in n or "pajak" in n or "retribusi" in n or "lain-lain pad" in n or "hasil pengelolaan" in n:
+        return "PAD"
+    # TRANSFER / TKDD
+    if "tkdd" in n or "transfer" in n or "dau" in n or "dak" in n or "dbh" in n:
+        return "TRANSFER"
+    # PENDAPATAN DAERAH (umbrella)
+    if "pendapatan daerah" in n or n.strip().startswith("pendapatan"):
+        return "PENDAPATAN"
+    # BELANJA OPERASI
+    if "belanja pegawai" in n or "belanja barang" in n or "belanja jasa" in n or "belanja barang dan jasa" in n:
+        return "BELANJA_OPERASI"
+    # BELANJA MODAL
+    if "belanja modal" in n or "modal" in n and "belanja" in n:
+        return "BELANJA_MODAL"
+    # BELANJA LAINNYA
+    if "hibah" in n or "bantuan" in n or "subsidi" in n:
+        return "BELANJA_LAINNYA"
+    # BELANJA TIDAK TERDUGA
+    if "tidak terduga" in n:
+        return "BELANJA_TIDAK_TERDUGA"
+    # PEMBIAYAAN
+    if "pembiayaan" in n:
+        return "PEMBIAYAAN"
+    # fallback
+    return "LAINNYA"
+
+# ----------------------------
+# Streamlit UI
+# ----------------------------
+st.sidebar.header("Kontrol")
+st.sidebar.info("Gunakan template jika upload file dari portal APBD yang struktur beda.")
+st.sidebar.markdown("*Tips:* jika upload gagal, download template lalu salin/format kolom sesuai.")
+
+page = st.sidebar.selectbox("Menu", ["Home","Upload & Analyze","Download Template","Help"])
+
 if page == "Home":
-    st.title("📊 APBD —Rasio Keuangan & Fraud Detection")
-    st.markdown("""
-    Aplikasi ini membantu:
-    - Menghitung rasio keuangan (kemandirian, efektivitas, efisiensi, dll.)
-    - Mendeteksi anomali anggaran (macro-level) menggunakan IsolationForest
-    - Memberi penjelasan otomatis (opsional) via Groq API
-    ---
-    *Cara pakai singkat:*
-    1. Download template Excel (menu Download Template) lalu isi data sesuai kolom.  
-    2. Upload file .xlsx di menu APBD Analyzer / Fraud Detection.  
-    3. Cek validasi kolom — aplikasi akan memberi pesan jelas jika ada kolom hilang.
+    st.header("Cara singkat pakai aplikasi")
+    st.write("""
+    1. Jika data mentah dari portal APBD — cukup upload file .xlsx di menu Upload & Analyze.  
+    2. Aplikasi akan mencoba mendeteksi kolom Anggaran & Realisasi dan melakukan cleaning otomatis.  
+    3. Jika format sangat berbeda, gunakan menu Download Template untuk membuat file contoh dan pindahkan data.  
     """)
+    st.markdown("*Contoh file yang bisa diupload:* file Excel yang hanya berisi kolom: Akun dan angka Anggaran/Realisasi, format angka bebas (mengandung Rp, titik, koma).")
+    st.markdown("---")
 
-# -----------------------
-# Download Template
-# -----------------------
 elif page == "Download Template":
-    st.header("Download Template Excel APBD (untuk upload)")
-    st.write("Klik tombol di bawah untuk mendownload template .xlsx. Isi data sesuai kolom header yang tersedia.")
+    st.header("Download Template APBD (.xlsx)")
     buf = make_template_excel()
     st.download_button("Download template_apbd.xlsx", data=buf, file_name="template_apbd.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.markdown("*Kolom wajib (header persis):*")
-    st.write(TEMPLATE_COLUMNS)
+    st.markdown("Template berisi contoh header: " + ", ".join(TEMPLATE_COLUMNS))
 
-# -----------------------
-# APBD Analyzer (rasio & visual)
-# -----------------------
-elif page == "APBD Analyzer":
-    st.header("APBD Analyzer — Hitung Rasio & Visualisasi")
-    uploaded = st.file_uploader("Upload file APBD (.xlsx) - gunakan template", type=["xlsx"], key="analyzer")
+elif page == "Help":
+    st.header("Help & Troubleshoot")
+    st.markdown("""
+    - Pastikan file adalah .xlsx.  
+    - Jika muncul error Missing optional dependency 'openpyxl' saat deploy, tambahkan openpyxl ke requirements.txt.  
+    - Jika kolom tidak terdeteksi, gunakan nama kolom yang mengandung kata 'Anggaran' atau 'Realisasi' atau 'Realisasi' (bisa bahasa Indonesia/Inggris).  
+    - Jika upload membingungkan, unggah dulu sample kecil (5-20 baris) untuk uji.
+    """)
+    st.markdown("---")
+
+elif page == "Upload & Analyze":
+    st.header("Upload file APBD (.xlsx) — app akan coba normalisasi otomatis")
+    uploaded = st.file_uploader("Pilih file .xlsx (mentah dari portal APBD atau file lain)", type=["xlsx"])
     if uploaded is None:
-        st.info("Upload file .xlsx terlebih dahulu, atau download template di menu 'Download Template'.")
+        st.info("Silakan unggah file Excel untuk dianalisis. Kalau belum punya file, download template di menu Download Template.")
         st.stop()
 
-    # read excel with error handling
+    # baca file
     try:
-        df = pd.read_excel(uploaded)
+        raw = pd.read_excel(uploaded, sheet_name=0, dtype=str)
     except Exception as e:
-        st.error(f"Gagal membaca file Excel: {e}")
+        st.error("Gagal membaca file Excel: " + str(e))
         st.stop()
 
-    st.subheader("Preview (5 baris)")
-    st.dataframe(df.head(), use_container_width=True)
+    st.subheader("Preview (5 baris dari file mentah)")
+    st.dataframe(raw.head(), use_container_width=True)
 
-    # validate columns
-    required_cols = TEMPLATE_COLUMNS
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        st.error("Kolom tidak lengkap. Kolom yang hilang: " + ", ".join(missing))
-        st.info("Pastikan header persis sesuai template (case-sensitive).")
+    # --- DETEKSI KOLom ANGGARAN/REALISASI/AKUN ---
+    # cari kolom akun
+    akun_col = find_column_by_keywords(raw, ["akun","nama akun","rekening","uraian","keterangan","akun "]) or raw.columns[0]
+    anggaran_col = find_column_by_keywords(raw, ["anggaran","pagu","nilai anggaran","nilai","budget","anggaran (rp)"])
+    realisasi_col = find_column_by_keywords(raw, ["realisasi","realisasi (rp)","realisasi (%)","realisasi anggaran","realisasi (rp)","realisasi"])
+    persen_col = find_column_by_keywords(raw, ["persentase","persen","%"])
+
+    st.markdown(f"*Deteksi kolom* → Akun: {akun_col}, Anggaran: {anggaran_col}, Realisasi: {realisasi_col}, Persen: {persen_col}")
+
+    # jika anggaran atau realisasi tidak terdeteksi, coba heuristik: jika ada kolom bertipe numeric (string numeric) pilih salah satu
+    if anggaran_col is None or realisasi_col is None:
+        # cari kolom yang is_numeric
+        numeric_candidates = []
+        for c in raw.columns:
+            sample = raw[c].dropna().astype(str).head(10).tolist()
+            numeric_like = all(re.sub(r'[^\d\.\,\-\(\)]','',s).strip() != "" for s in sample) if sample else False
+            if numeric_like:
+                numeric_candidates.append(c)
+        # assign
+        if anggaran_col is None and len(numeric_candidates) >= 1:
+            anggaran_col = numeric_candidates[0]
+        if realisasi_col is None and len(numeric_candidates) >= 2:
+            realisasi_col = numeric_candidates[1] if numeric_candidates[1] != anggaran_col else numeric_candidates[0]
+
+    # jika tetap None -> inform user
+    if anggaran_col is None or realisasi_col is None:
+        st.error("Tidak dapat mendeteksi kolom Anggaran/Realisasi. Pastikan file berisi kolom angka atau gunakan template.")
         st.stop()
 
-    # compute totals and rasio (persen)
-    totals = {
-        "PAD": df["PAD"].sum(),
-        "Transfer": df["Dana_Transfer"].sum(),
-        "Realisasi_PAD": df["Realisasi_PAD"].sum(),
-        "Target_PAD": df["Target_PAD"].sum(),
-        "Belanja_Realisasi": df["Belanja_Operasi"].sum() + df["Belanja_Modal"].sum(),
-        "Anggaran_Belanja": df["Anggaran_Belanja"].sum(),
-        "Total_Belanja": df["Total_Belanja"].sum(),
-        "Pendapatan_Daerah": df["Pendapatan_Daerah"].sum()
-    }
+    # buat salinan bersih
+    df = raw[[akun_col, anggaran_col, realisasi_col]].copy()
+    df.columns = ["Akun","Anggaran","Realisasi"]
+    # remove whitespace
+    df["Akun"] = df["Akun"].astype(str).str.strip()
 
-    def rasio_kemandirian(pad, transfer): return (pad / transfer * 100) if transfer != 0 else 0
-    def rasio_efektivitas(realisasi, target): return (realisasi / target * 100) if target != 0 else 0
-    def rasio_efisiensi(realisasi_belanja, anggaran_belanja): return (realisasi_belanja / anggaran_belanja * 100) if anggaran_belanja != 0 else 0
-    def rasio_bo(b_op, total_b): return (b_op / total_b * 100) if total_b != 0 else 0
-    def rasio_bm(b_mod, total_b): return (b_mod / total_b * 100) if total_b != 0 else 0
+    # parse angka
+    df["Anggaran_num"] = df["Anggaran"].apply(parse_number)
+    df["Realisasi_num"] = df["Realisasi"].apply(parse_number)
 
-    rasios = {
-        "Rasio Kemandirian (%)": round(rasio_kemandirian(totals["PAD"], totals["Transfer"]), 2),
-        "Rasio Efektivitas PAD (%)": round(rasio_efektivitas(totals["Realisasi_PAD"], totals["Target_PAD"]), 2),
-        "Rasio Efisiensi (%)": round(rasio_efisiensi(totals["Belanja_Realisasi"], totals["Anggaran_Belanja"]), 2),
-        "Rasio Belanja Operasi (%)": round(rasio_bo(df["Belanja_Operasi"].sum(), totals["Total_Belanja"]), 2),
-        "Rasio Belanja Modal (%)": round(rasio_bm(df["Belanja_Modal"].sum(), totals["Total_Belanja"]), 2)
-    }
+    # compute percent if absent
+    df["Persentase_calc"] = np.where(df["Anggaran_num"] != 0, df["Realisasi_num"] / df["Anggaran_num"] * 100, 0)
 
-    st.subheader("Ringkasan Rasio")
-    st.json(rasios)
+    # classify account
+    df["Kategori"] = df["Akun"].apply(classify_account)
 
-    # visual: trend PAD vs Total Belanja by Tahun (jika ada lebih dari 1 tahun)
-    if "Tahun" in df.columns:
-        pivot = df.groupby("Tahun").agg({"PAD":"sum","Total_Belanja":"sum"}).reset_index()
-        fig = px.line(pivot, x="Tahun", y=["PAD","Total_Belanja"], title="Tren PAD vs Total Belanja")
-        st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Data setelah cleaning & kategorisasi (contoh 50 baris)")
+    st.dataframe(df.head(50), use_container_width=True)
 
-    # composition pie
-    st.subheader("Komposisi Belanja")
+    # aggregate by Kategori
+    agg = df.groupby("Kategori").agg({
+        "Anggaran_num":"sum",
+        "Realisasi_num":"sum"
+    }).reset_index().rename(columns={"Anggaran_num":"Anggaran","Realisasi_num":"Realisasi"})
+
+    st.subheader("Aggregasi per Kategori")
+    st.dataframe(agg, use_container_width=True)
+
+    # TOTALS needed for rasio
+    PAD_total = agg.loc[agg["Kategori"] == "PAD", "Realisasi"].sum() if "PAD" in agg["Kategori"].values else 0.0
+    TRANSFER_total = agg.loc[agg["Kategori"] == "TRANSFER", "Realisasi"].sum() if "TRANSFER" in agg["Kategori"].values else 0.0
+    BELANJA_OPERASI_total = agg.loc[agg["Kategori"] == "BELANJA_OPERASI", "Realisasi"].sum() if "BELANJA_OPERASI" in agg["Kategori"].values else 0.0
+    BELANJA_MODAL_total = agg.loc[agg["Kategori"] == "BELANJA_MODAL", "Realisasi"].sum() if "BELANJA_MODAL" in agg["Kategori"].values else 0.0
+    TOTAL_BELANJA = agg[agg["Kategori"].str.contains("BELANJA")]["Realisasi"].sum()
+
+    # rasio calculations (percent)
+    def safe_div(a,b):
+        return (a/b*100) if (b and b!=0) else 0.0
+
+    rasio_kemandirian = safe_div(PAD_total, TRANSFER_total)
+    rasio_belanja_operasi = safe_div(BELANJA_OPERASI_total, TOTAL_BELANJA)
+    rasio_belanja_modal = safe_div(BELANJA_MODAL_total, TOTAL_BELANJA)
+
+    st.subheader("Hasil Rasio (persentase)")
+    st.metric("Rasio Kemandirian (PAD / Transfer) %", f"{rasio_kemandirian:.2f}")
+    st.metric("Rasio Belanja Operasi %", f"{rasio_belanja_operasi:.2f}")
+    st.metric("Rasio Belanja Modal %", f"{rasio_belanja_modal:.2f}")
+
+    # visual: pie composition belanja
     comp = pd.DataFrame({
-        "Kategori":["Belanja Operasi","Belanja Modal"],
-        "Nilai":[df["Belanja_Operasi"].sum(), df["Belanja_Modal"].sum()]
+        "Kategori":["Belanja Operasi","Belanja Modal","Belanja Lainnya"],
+        "Nilai":[BELANJA_OPERASI_total, BELANJA_MODAL_total, TOTAL_BELANJA - BELANJA_OPERASI_total - BELANJA_MODAL_total]
     })
-    figp = px.pie(comp, names="Kategori", values="Nilai", title="Komposisi Belanja")
+    figp = px.pie(comp, names="Kategori", values="Nilai", title="Komposisi Belanja (Realisasi)")
     st.plotly_chart(figp, use_container_width=True)
 
-    # allow download report CSV
-    st.subheader("Ekspor Ringkasan")
-    if st.button("Download ringkasan rasio (CSV)"):
-        out = pd.DataFrame([rasios])
-        csv = out.to_csv(index=False).encode("utf-8")
-        st.download_button("Klik untuk download CSV", data=csv, file_name="ringkasan_rasio.csv", mime="text/csv")
+    # trend if Tahun present in raw
+    tahun_col = find_column_by_keywords(raw, ["tahun","periode"])
+    if tahun_col:
+        try:
+            raw[tahun_col] = raw[tahun_col].astype(str)
+            pivot = raw.groupby(tahun_col).apply(lambda g: parse_number(g[realisasi_col]).sum()).reset_index()
+            pivot.columns = [tahun_col, "Total_Realisasi"]
+            figt = px.line(pivot, x=tahun_col, y="Total_Realisasi", title="Tren Realisasi per Tahun")
+            st.plotly_chart(figt, use_container_width=True)
+        except Exception:
+            pass
 
-# -----------------------
-# Fraud Detection
-# -----------------------
-elif page == "Fraud Detection":
-    st.header("Fraud Detection (Macro-level) — Outlier & Risk Scoring")
-    uploaded = st.file_uploader("Upload file APBD (.xlsx) - gunakan template", type=["xlsx"], key="fraud")
-    if uploaded is None:
-        st.info("Upload file .xlsx terlebih dahulu, atau download template di menu 'Download Template'.")
-        st.stop()
+    # export cleaned aggregated data
+    st.subheader("Download hasil cleaning & agregasi")
+    download_df = agg.copy()
+    csv = download_df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download CSV (aggregated)", data=csv, file_name="apbd_aggregated.csv", mime="text/csv")
 
-    # read excel
-    try:
-        df = pd.read_excel(uploaded)
-    except Exception as e:
-        st.error(f"Gagal membaca file Excel: {e}")
-        st.stop()
-
-    # validate
-    required_cols = TEMPLATE_COLUMNS
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        st.error("Kolom tidak lengkap. Kolom yang hilang: " + ", ".join(missing))
-        st.stop()
-
-    st.subheader("Preview data")
-    st.dataframe(df.head(), use_container_width=True)
-
-    # Feature engineering minimal
-    df["prop_total"] = df["Nilai_Transaksi"] / (df["Total_Belanja"].sum() + 1e-9)
-    df["log_val"] = np.log1p(df["Nilai_Transaksi"].fillna(0))
-
-    X = df[["log_val","prop_total"]].fillna(0).values
-
-    n_estimators = st.sidebar.slider("Jumlah trees (IsolationForest)", 50, 300, 100)
-    contamination = st.sidebar.slider("Perkiraan proporsi anomali (contamination)", 0.001, 0.2, 0.02, step=0.001)
-
-    model = IsolationForest(n_estimators=n_estimators, contamination=contamination, random_state=42)
-    with st.spinner("Melatih model..."):
-        model.fit(X)
-
-    df["anomaly_score"] = model.decision_function(X)  # higher = normal, lower = anomaly
-    df["is_anomaly_flag"] = model.predict(X) == -1  # True for anomaly
-
-    st.success(f"Deteksi selesai. Baris ter-flag anomali: {df['is_anomaly_flag'].sum()} dari {len(df)}")
-
-    st.subheader("Daftar Anomali (terurut)")
-    anomali_df = df[df["is_anomaly_flag"]].sort_values("anomaly_score")
-    display_cols = ["Tahun","SKPD","Kode_Rekening","Uraian","Nilai_Transaksi","anomaly_score"]
-    st.dataframe(anomali_df[display_cols].head(200), use_container_width=True)
-
-    # allow user to inspect full table with highlighting (uses st.dataframe; style not perfectly supported in cloud)
-    st.subheader("Tabel lengkap (anomaly flag shown)")
-    st.dataframe(df[[*TEMPLATE_COLUMNS,"prop_total","log_val","anomaly_score","is_anomaly_flag"]].head(500), use_container_width=True)
-
-    # Groq interpretation
-    st.subheader("Interpretasi otomatis (Groq) — opsional")
+    # optional: Groq explanation for top categories or items
+    st.subheader("Interpretasi AI (opsional) — Groq")
     groq_key = st.text_input("Masukkan Groq API Key (opsional)", type="password")
     if groq_key:
-        top_n = st.number_input("Berapa anomali teratas yang mau dijelaskan?", min_value=1, max_value=10, value=3)
-        top = anomali_df.head(top_n)
-        for i, row in top.iterrows():
-            prompt = f"""
-            Baris data APBD yang dicurigai anomali:
-            Tahun: {row.get('Tahun')}, SKPD: {row.get('SKPD')}, Kode: {row.get('Kode_Rekening')},
-            Uraian: {row.get('Uraian')}, Nilai: {row.get('Nilai_Transaksi')}, anomaly_score: {row.get('anomaly_score')}.
-            Jelaskan mengapa baris ini bisa dicurigai (singkat), dan rekomendasi pemeriksaan.
-            """
-            try:
-                r = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {groq_key}"},
-                    json={
-                        "model": "mixtral-8x7b-32768",
-                        "messages": [{"role":"user","content":prompt}]
-                    },
-                    timeout=15
-                )
-                txt = r.json()["choices"][0]["message"]["content"]
-                st.markdown(f"*Analisis (Kode {row.get('Kode_Rekening')} / SKPD {row.get('SKPD')}):*")
-                st.write(txt)
-            except Exception as e:
-                st.error(f"Gagal panggil Groq: {e}")
-                break
+        # prepare short prompt
+        top_k = agg.sort_values("Realisasi", ascending=False).head(5)
+        prompt = "Berikan analisis singkat mengenai kategori-kategori berikut berdasarkan realisasi (angka dalam rupiah):\n"
+        for _, r in top_k.iterrows():
+            prompt += f"- {r['Kategori']}: Realisasi = {r['Realisasi']:.0f}\n"
+        prompt += "\nSebutkan potensi risiko dan rekomendasi sederhana."
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {groq_key}"},
+                json={"model":"mixtral-8x7b-32768", "messages":[{"role":"user","content":prompt}]},
+                timeout=15
+            )
+            ai = r.json()["choices"][0]["message"]["content"]
+            st.markdown("*Analisis AI:*")
+            st.write(ai)
+        except Exception as e:
+            st.error("Gagal panggil Groq: " + str(e))
 
-    # download flagged results
-    st.subheader("Ekspor hasil deteksi")
-    if st.button("Download hasil dengan flag (CSV)"):
-        out = df.copy()
-        csv = out.to_csv(index=False).encode("utf-8")
-        st.download_button("Klik untuk download", data=csv, file_name="apbd_with_flags.csv", mime="text/csv")
-
-# End of file
+    st.info("Selesai. Jika tampilan data tidak sesuai, coba bersihkan header di Excel atau gunakan Template.")
